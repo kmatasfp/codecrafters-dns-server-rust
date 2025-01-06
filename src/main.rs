@@ -6,6 +6,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     InvalidHeader,
+    InvalidQuestion,
 }
 
 impl core::fmt::Display for Error {
@@ -105,6 +106,32 @@ impl From<&DnsMessageHeader> for [u8; 12] {
     }
 }
 
+#[derive(Debug)]
+struct DnsMessageQuestion {
+    name: Vec<u8>,
+    qtype: u16,
+    class: u16,
+}
+
+impl TryFrom<&[u8]> for DnsMessageQuestion {
+    type Error = Error;
+
+    fn try_from(question_bytes: &[u8]) -> std::result::Result<Self, Self::Error> {
+        todo!()
+    }
+}
+
+impl From<&DnsMessageQuestion> for Vec<u8> {
+    fn from(question: &DnsMessageQuestion) -> Self {
+        let mut buf: Vec<u8> = Vec::from(question.name.as_slice());
+
+        buf.extend_from_slice(&question.qtype.to_be_bytes());
+        buf.extend_from_slice(&question.class.to_be_bytes());
+
+        buf
+    }
+}
+
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
@@ -135,15 +162,35 @@ fn main() {
                     ra: false,
                     z: 0,
                     rcode: 0,
-                    qd_count: 0,
+                    qd_count: 1,
                     an_count: 0,
                     ns_count: 0,
                     ar_count: 0,
                 };
 
-                let response: [u8; 12] = (&response_header).into();
+                let response_header: [u8; 12] = (&response_header).into();
+
+                let fixed_name = {
+                    let mut buf: Vec<u8> = vec![12];
+                    buf.extend_from_slice("codecrafters".as_bytes());
+                    buf.push(2);
+                    buf.extend_from_slice("io".as_bytes());
+                    buf.push(b'\0');
+
+                    buf
+                };
+
+                let response_question = DnsMessageQuestion {
+                    name: fixed_name,
+                    qtype: 1,
+                    class: 1,
+                };
+
                 udp_socket
-                    .send_to(&response, source)
+                    .send_to(
+                        &([Vec::from(response_header), (&response_question).into()].concat()),
+                        source,
+                    )
                     .expect("Failed to send response");
             }
             Err(e) => {
