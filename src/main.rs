@@ -167,30 +167,23 @@ fn main() {
     loop {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
-                let request_header: DnsMessageHeader = (&buf[0..12])
+                let mut request_header: DnsMessageHeader = (&buf[0..12])
                     .try_into()
                     .expect("incorrect DNS message header");
 
-                println!(
-                    "Received {} bytes from {}, {:?}",
-                    size, source, request_header
-                );
+                println!("Received {} bytes from {}", size, source);
 
-                let response_header = DnsMessageHeader {
-                    id: 1234,
-                    qr: true,
-                    op_code: 0,
-                    aa: false,
-                    tc: false,
-                    rd: false,
-                    ra: false,
-                    z: 0,
-                    rcode: 0,
-                    qd_count: 1,
-                    an_count: 1,
-                    ns_count: 0,
-                    ar_count: 0,
-                };
+                request_header.qr = true;
+                request_header.qd_count = 1;
+                request_header.an_count = 1;
+
+                if request_header.op_code == 0 {
+                    request_header.rcode = 0;
+                } else {
+                    request_header.rcode = 4;
+                }
+
+                let response_header = request_header;
 
                 let response_header: [u8; 12] = (&response_header).into();
 
