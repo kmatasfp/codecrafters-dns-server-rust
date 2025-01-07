@@ -161,8 +161,8 @@ fn dns_questions_from_bytes(
         q_index: usize,
     ) -> Result<(DnsMessageQuestion, usize)> {
         // todo return number of bytes read
-        fn parse_labels(data: &[u8], size: &usize, l_index: usize) -> Result<(Vec<u8>, usize)> {
-            fn is_valid_pointer(byte: &u8) -> bool {
+        fn parse_labels(data: &[u8], l_index: usize) -> Result<(Vec<u8>, usize)> {
+            fn is_valid_compression_pointer(byte: &u8) -> bool {
                 byte >> 6 & 0b0000_0011 == 0b0000_0011
             }
 
@@ -178,12 +178,11 @@ fn dns_questions_from_bytes(
                         labels.extend_from_slice(&data[index..index + *len as usize + 1]);
                         index += *len as usize + 1;
                     }
-                    pointer if is_valid_pointer(pointer) => {
+                    pointer if is_valid_compression_pointer(pointer) => {
                         let mut offset = u16::from_be_bytes([*pointer, data[index + 1]]);
                         offset &= !(0b11 << 14); // zero out leftmost 2 bits
 
-                        let (compressed_labels, _) =
-                            parse_labels(data, size, offset as usize - 12)?; // -12 because of headers are 12 bytes
+                        let (compressed_labels, _) = parse_labels(data, offset as usize - 12)?; // -12 because of headers are 12 bytes
 
                         index += 1;
 
@@ -205,7 +204,7 @@ fn dns_questions_from_bytes(
             return Err(Error::InvalidQuestion);
         }
 
-        let (labels, label_size_in_bytes) = parse_labels(data, size, q_index)?;
+        let (labels, label_size_in_bytes) = parse_labels(data, q_index)?;
 
         if q_index + label_size_in_bytes + 4 > *size {
             return Err(Error::InvalidQuestion);
