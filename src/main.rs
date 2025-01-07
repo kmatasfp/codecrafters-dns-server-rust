@@ -107,13 +107,13 @@ impl From<&DnsMessageHeader> for [u8; 12] {
 }
 
 #[derive(Debug)]
-struct DnsMessageQuestion {
-    name: Vec<u8>,
+struct DnsMessageQuestion<'a> {
+    name: &'a Vec<u8>,
     qtype: u16,
     class: u16,
 }
 
-impl TryFrom<&[u8]> for DnsMessageQuestion {
+impl TryFrom<&[u8]> for DnsMessageQuestion<'_> {
     type Error = Error;
 
     fn try_from(question_bytes: &[u8]) -> std::result::Result<Self, Self::Error> {
@@ -121,12 +121,36 @@ impl TryFrom<&[u8]> for DnsMessageQuestion {
     }
 }
 
-impl From<&DnsMessageQuestion> for Vec<u8> {
+impl<'a> From<&'a DnsMessageQuestion<'a>> for Vec<u8> {
     fn from(question: &DnsMessageQuestion) -> Self {
         let mut buf: Vec<u8> = Vec::from(question.name.as_slice());
 
         buf.extend_from_slice(&question.qtype.to_be_bytes());
         buf.extend_from_slice(&question.class.to_be_bytes());
+
+        buf
+    }
+}
+
+#[derive(Debug)]
+struct DnsMessageResponse<'a> {
+    name: &'a Vec<u8>,
+    qtype: u16,
+    class: u16,
+    ttl: u32,
+    length: u16,
+    data: Vec<u8>,
+}
+
+impl<'a> From<&'a DnsMessageResponse<'a>> for Vec<u8> {
+    fn from(response: &DnsMessageResponse) -> Self {
+        let mut buf: Vec<u8> = Vec::from(response.name.as_slice());
+
+        buf.extend_from_slice(&response.qtype.to_be_bytes());
+        buf.extend_from_slice(&response.class.to_be_bytes());
+        buf.extend_from_slice(&response.ttl.to_be_bytes());
+        buf.extend_from_slice(&response.length.to_be_bytes());
+        buf.extend_from_slice(&response.data[..]);
 
         buf
     }
@@ -163,7 +187,7 @@ fn main() {
                     z: 0,
                     rcode: 0,
                     qd_count: 1,
-                    an_count: 0,
+                    an_count: 1,
                     ns_count: 0,
                     ar_count: 0,
                 };
@@ -181,14 +205,28 @@ fn main() {
                 };
 
                 let response_question = DnsMessageQuestion {
-                    name: fixed_name,
+                    name: &fixed_name,
                     qtype: 1,
                     class: 1,
                 };
 
+                let response_answer = DnsMessageResponse {
+                    name: &fixed_name,
+                    qtype: 1,
+                    class: 1,
+                    ttl: 60,
+                    length: 4,
+                    data: vec![8, 8, 8, 8],
+                };
+
                 udp_socket
                     .send_to(
-                        &([Vec::from(response_header), (&response_question).into()].concat()),
+                        &([
+                            Vec::from(response_header),
+                            (&response_question).into(),
+                            (&response_answer).into(),
+                        ]
+                        .concat()),
                         source,
                     )
                     .expect("Failed to send response");
