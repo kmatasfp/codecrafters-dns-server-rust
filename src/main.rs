@@ -1,4 +1,3 @@
-#[allow(unused_imports)]
 use std::net::UdpSocket;
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -114,53 +113,6 @@ struct DnsMessageQuestion {
     size_in_bytes: usize,
 }
 
-impl TryFrom<&[u8]> for DnsMessageQuestion {
-    type Error = Error;
-
-    fn try_from(question_bytes: &[u8]) -> std::result::Result<Self, Self::Error> {
-        if question_bytes[0] == 0 {
-            return Err(Error::InvalidQuestion);
-        }
-
-        if question_bytes[0] == b'\0' {
-            return Err(Error::InvalidQuestion);
-        }
-
-        if question_bytes.len() < question_bytes[0] as usize + 1 {
-            return Err(Error::InvalidQuestion);
-        }
-
-        let mut name: Vec<u8> = question_bytes
-            .iter()
-            .take_while(|b| **b != b'\0')
-            .map(|b| b.to_owned())
-            .collect();
-
-        name.push(b'\0');
-
-        if name.len() + 4 > question_bytes.len() {
-            return Err(Error::InvalidQuestion);
-        }
-
-        let qtype =
-            u16::from_be_bytes([question_bytes[name.len()], question_bytes[name.len() + 1]]);
-
-        let class = u16::from_be_bytes([
-            question_bytes[name.len() + 2],
-            question_bytes[name.len() + 3],
-        ]);
-
-        let size_in_bytes = name.len() + 4;
-
-        Ok(DnsMessageQuestion {
-            name,
-            qtype,
-            class,
-            size_in_bytes,
-        })
-    }
-}
-
 impl From<&DnsMessageQuestion> for Vec<u8> {
     fn from(question: &DnsMessageQuestion) -> Self {
         let mut buf: Vec<u8> = Vec::from(question.name.as_slice());
@@ -196,6 +148,87 @@ impl<'a> From<&'a DnsMessageResponse<'a>> for Vec<u8> {
     }
 }
 
+fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<DnsMessageQuestion>> {
+    fn parse_question(data: &[u8], q_index: usize) -> Result<DnsMessageQuestion> {
+        fn parse_labels(data: &[u8], l_index: usize) -> Result<(Vec<u8>, usize)> {
+            fn is_valid_pointer(byte: &u8) -> bool {
+                byte >> 6 & 0b0000_0011 == 0b0000_0011
+            }
+
+            let mut labels = Vec::new();
+            let mut index = l_index;
+            loop {
+                match &data[index] {
+                    0 => {
+                        labels.push(b'\0');
+                        break;
+                    }
+                    len @ 1..=63 => {
+                        labels.extend_from_slice(&data[index..index + *len as usize + 1]);
+                        index += *len as usize + 1;
+                    }
+                    pointer if is_valid_pointer(pointer) => {
+                        let mut offset = u16::from_be_bytes([*pointer, data[index + 1]]);
+                        offset &= !(0b11 << 14); // zero out leftmost 2 bits
+
+                        let (compressed_labels, _) =
+                            parse_labels(data, offset as usize - 12).unwrap(); // -12 because of headers are 12 bytes
+
+                        index += 1;
+
+                        labels.extend(compressed_labels);
+                        break;
+                    }
+                    _ => return Err(Error::InvalidQuestion),
+                }
+            }
+
+            Ok((labels, index + 1))
+        }
+
+        if data[q_index] == 0 {
+            return Err(Error::InvalidQuestion);
+        }
+
+        if data[q_index] == b'\0' {
+            return Err(Error::InvalidQuestion);
+        }
+
+        if data.len() < data[q_index] as usize + 1 {
+            return Err(Error::InvalidQuestion);
+        }
+
+        let (labels, next_idx_to_read) = parse_labels(data, q_index).unwrap();
+
+        if labels.len() + 4 > data.len() {
+            return Err(Error::InvalidQuestion);
+        }
+
+        let qtype = u16::from_be_bytes([data[next_idx_to_read], data[next_idx_to_read + 1]]);
+
+        let class = u16::from_be_bytes([data[next_idx_to_read + 2], data[next_idx_to_read + 3]]);
+
+        let size_in_bytes = next_idx_to_read - q_index + 4;
+
+        Ok(DnsMessageQuestion {
+            name: labels,
+            qtype,
+            class,
+            size_in_bytes,
+        })
+    }
+
+    let mut questions: Vec<DnsMessageQuestion> = Vec::new();
+    let mut index = 0;
+    for _ in 0..*nr_of_questions {
+        let question = parse_question(data, index).unwrap();
+        index += question.size_in_bytes;
+        questions.push(question);
+    }
+
+    Ok(questions)
+}
+
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
     println!("Logs from your program will appear here!");
@@ -213,13 +246,8 @@ fn main() {
                     .try_into()
                     .expect("incorrect DNS message header");
 
-                let mut questions: Vec<DnsMessageQuestion> = Vec::new();
-                let mut index = 12;
-                for _ in 0..request_header.qd_count {
-                    let question: DnsMessageQuestion = (&buf[index..]).try_into().unwrap();
-                    index += question.size_in_bytes;
-                    questions.push(question);
-                }
+                let questions =
+                    dns_questions_from_bytes(&buf[12..], &request_header.qd_count).unwrap();
 
                 let answers: Vec<DnsMessageResponse> = questions
                     .iter()
@@ -240,8 +268,8 @@ fn main() {
                 // reponses section
 
                 request_header.qr = true;
-                request_header.qd_count = 1;
-                request_header.an_count = 1;
+                request_header.qd_count = questions.len() as u16;
+                request_header.an_count = answers.len() as u16;
 
                 if request_header.op_code == 0 {
                     request_header.rcode = 0;
@@ -251,16 +279,6 @@ fn main() {
 
                 let response_header = request_header;
                 let response_header_bytes: [u8; 12] = (&response_header).into();
-
-                // let fixed_name = {
-                //     let mut buf: Vec<u8> = vec![12];
-                //     buf.extend_from_slice("codecrafters".as_bytes());
-                //     buf.push(2);
-                //     buf.extend_from_slice("io".as_bytes());
-                //     buf.push(b'\0');
-
-                //     buf
-                // };
 
                 let response_question_bytes: Vec<u8> =
                     questions.iter().flat_map(Vec::from).collect();
