@@ -110,7 +110,6 @@ struct DnsMessageQuestion {
     name: Vec<u8>,
     qtype: u16,
     class: u16,
-    size_in_bytes: usize,
 }
 
 impl From<&DnsMessageQuestion> for Vec<u8> {
@@ -149,7 +148,9 @@ impl<'a> From<&'a DnsMessageResponse<'a>> for Vec<u8> {
 }
 
 fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<DnsMessageQuestion>> {
-    fn parse_question(data: &[u8], q_index: usize) -> Result<DnsMessageQuestion> {
+    // todo retun number of bytes read
+    fn parse_question(data: &[u8], q_index: usize) -> Result<(DnsMessageQuestion, usize)> {
+        // todo return number of bytes read
         fn parse_labels(data: &[u8], l_index: usize) -> Result<(Vec<u8>, usize)> {
             fn is_valid_pointer(byte: &u8) -> bool {
                 byte >> 6 & 0b0000_0011 == 0b0000_0011
@@ -183,7 +184,7 @@ fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<Dn
                 }
             }
 
-            Ok((labels, index + 1))
+            Ok((labels, index + 1 - l_index))
         }
 
         if data[q_index] == 0 {
@@ -198,31 +199,39 @@ fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<Dn
             return Err(Error::InvalidQuestion);
         }
 
-        let (labels, next_idx_to_read) = parse_labels(data, q_index).unwrap();
+        let (labels, label_size_in_bytes) = parse_labels(data, q_index).unwrap();
 
         if labels.len() + 4 > data.len() {
             return Err(Error::InvalidQuestion);
         }
 
-        let qtype = u16::from_be_bytes([data[next_idx_to_read], data[next_idx_to_read + 1]]);
+        let qtype = u16::from_be_bytes([
+            data[q_index + label_size_in_bytes],
+            data[q_index + label_size_in_bytes + 1],
+        ]);
 
-        let class = u16::from_be_bytes([data[next_idx_to_read + 2], data[next_idx_to_read + 3]]);
+        let class = u16::from_be_bytes([
+            data[q_index + label_size_in_bytes + 2],
+            data[q_index + label_size_in_bytes + 3],
+        ]);
 
-        let size_in_bytes = next_idx_to_read - q_index + 4;
+        let size_in_bytes = label_size_in_bytes + 4;
 
-        Ok(DnsMessageQuestion {
-            name: labels,
-            qtype,
-            class,
+        Ok((
+            DnsMessageQuestion {
+                name: labels,
+                qtype,
+                class,
+            },
             size_in_bytes,
-        })
+        ))
     }
 
     let mut questions: Vec<DnsMessageQuestion> = Vec::new();
     let mut index = 0;
     for _ in 0..*nr_of_questions {
-        let question = parse_question(data, index).unwrap();
-        index += question.size_in_bytes;
+        let (question, size_in_bytes) = parse_question(data, index).unwrap();
+        index += size_in_bytes;
         questions.push(question);
     }
 
