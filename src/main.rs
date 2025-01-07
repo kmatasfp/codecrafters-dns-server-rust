@@ -1,5 +1,7 @@
 use std::net::UdpSocket;
 
+use bytes::{BufMut, BytesMut};
+
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -147,11 +149,19 @@ impl<'a> From<&'a DnsMessageResponse<'a>> for Vec<u8> {
     }
 }
 
-fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<DnsMessageQuestion>> {
+fn dns_questions_from_bytes(
+    data: &[u8],
+    size: usize,
+    nr_of_questions: &u16,
+) -> Result<Vec<DnsMessageQuestion>> {
     // todo retun number of bytes read
-    fn parse_question(data: &[u8], q_index: usize) -> Result<(DnsMessageQuestion, usize)> {
+    fn parse_question(
+        data: &[u8],
+        size: &usize,
+        q_index: usize,
+    ) -> Result<(DnsMessageQuestion, usize)> {
         // todo return number of bytes read
-        fn parse_labels(data: &[u8], l_index: usize) -> Result<(Vec<u8>, usize)> {
+        fn parse_labels(data: &[u8], size: &usize, l_index: usize) -> Result<(Vec<u8>, usize)> {
             fn is_valid_pointer(byte: &u8) -> bool {
                 byte >> 6 & 0b0000_0011 == 0b0000_0011
             }
@@ -173,7 +183,7 @@ fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<Dn
                         offset &= !(0b11 << 14); // zero out leftmost 2 bits
 
                         let (compressed_labels, _) =
-                            parse_labels(data, offset as usize - 12).unwrap(); // -12 because of headers are 12 bytes
+                            parse_labels(data, size, offset as usize - 12)?; // -12 because of headers are 12 bytes
 
                         index += 1;
 
@@ -191,17 +201,13 @@ fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<Dn
             return Err(Error::InvalidQuestion);
         }
 
-        if data[q_index] == b'\0' {
+        if *size < q_index + data[q_index] as usize + 1 {
             return Err(Error::InvalidQuestion);
         }
 
-        if data.len() < data[q_index] as usize + 1 {
-            return Err(Error::InvalidQuestion);
-        }
+        let (labels, label_size_in_bytes) = parse_labels(data, size, q_index)?;
 
-        let (labels, label_size_in_bytes) = parse_labels(data, q_index).unwrap();
-
-        if labels.len() + 4 > data.len() {
+        if q_index + label_size_in_bytes + 4 > *size {
             return Err(Error::InvalidQuestion);
         }
 
@@ -230,7 +236,7 @@ fn dns_questions_from_bytes(data: &[u8], nr_of_questions: &u16) -> Result<Vec<Dn
     let mut questions: Vec<DnsMessageQuestion> = Vec::new();
     let mut index = 0;
     for _ in 0..*nr_of_questions {
-        let (question, size_in_bytes) = parse_question(data, index).unwrap();
+        let (question, size_in_bytes) = parse_question(data, &size, index)?;
         index += size_in_bytes;
         questions.push(question);
     }
@@ -251,60 +257,66 @@ fn main() {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
 
-                let mut request_header: DnsMessageHeader = (&buf[0..12])
-                    .try_into()
-                    .expect("incorrect DNS message header");
+                if let Ok(mut request_header) = DnsMessageHeader::try_from(&buf[0..12]) {
+                    if let Ok(questions) =
+                        dns_questions_from_bytes(&buf[12..], size - 12, &request_header.qd_count)
+                    {
+                        let answers: Vec<DnsMessageResponse> = questions
+                            .iter()
+                            .map(|q| {
+                                let data = vec![1, 1, 1, 1];
 
-                let questions =
-                    dns_questions_from_bytes(&buf[12..], &request_header.qd_count).unwrap();
+                                DnsMessageResponse {
+                                    name: &q.name,
+                                    qtype: q.qtype,
+                                    class: q.class,
+                                    ttl: 60,
+                                    length: data.len() as u16,
+                                    data,
+                                }
+                            })
+                            .collect();
 
-                let answers: Vec<DnsMessageResponse> = questions
-                    .iter()
-                    .map(|q| {
-                        let data = vec![1, 1, 1, 1];
+                        // reponses section
 
-                        DnsMessageResponse {
-                            name: &q.name,
-                            qtype: q.qtype,
-                            class: q.class,
-                            ttl: 60,
-                            length: data.len() as u16,
-                            data,
+                        request_header.qr = true;
+                        request_header.qd_count = questions.len() as u16;
+                        request_header.an_count = answers.len() as u16;
+
+                        if request_header.op_code == 0 {
+                            request_header.rcode = 0;
+                        } else {
+                            request_header.rcode = 4;
                         }
-                    })
-                    .collect();
 
-                // reponses section
+                        let response_header = request_header;
+                        let response_header_bytes: [u8; 12] = (&response_header).into();
 
-                request_header.qr = true;
-                request_header.qd_count = questions.len() as u16;
-                request_header.an_count = answers.len() as u16;
+                        let response_question_bytes: Vec<u8> =
+                            questions.iter().flat_map(Vec::from).collect();
 
-                if request_header.op_code == 0 {
-                    request_header.rcode = 0;
+                        let response_answer_bytes: Vec<u8> =
+                            answers.iter().flat_map(Vec::from).collect();
+
+                        let mut response_bytes = BytesMut::with_capacity(
+                            response_answer_bytes.len()
+                                + response_question_bytes.len()
+                                + response_answer_bytes.len(),
+                        );
+
+                        response_bytes.put_slice(&response_header_bytes);
+                        response_bytes.put_slice(&response_question_bytes);
+                        response_bytes.put_slice(&response_answer_bytes);
+
+                        if let Err(e) = udp_socket.send_to(&response_bytes.freeze()[..], source) {
+                            eprintln!("Failed to send response, {}", e);
+                        }
+                    } else {
+                        eprintln!("Failed to parse questions from {:?}", buf);
+                    }
                 } else {
-                    request_header.rcode = 4;
+                    eprintln!("Failed to parse header from {:?}", buf);
                 }
-
-                let response_header = request_header;
-                let response_header_bytes: [u8; 12] = (&response_header).into();
-
-                let response_question_bytes: Vec<u8> =
-                    questions.iter().flat_map(Vec::from).collect();
-
-                let response_answer_bytes: Vec<u8> = answers.iter().flat_map(Vec::from).collect();
-
-                udp_socket
-                    .send_to(
-                        &([
-                            Vec::from(response_header_bytes),
-                            response_question_bytes,
-                            response_answer_bytes,
-                        ]
-                        .concat()),
-                        source,
-                    )
-                    .expect("Failed to send response");
             }
             Err(e) => {
                 eprintln!("Error receiving data: {}", e);
