@@ -107,21 +107,61 @@ impl From<&DnsMessageHeader> for [u8; 12] {
 }
 
 #[derive(Debug)]
-struct DnsMessageQuestion<'a> {
-    name: &'a Vec<u8>,
+struct DnsMessageQuestion {
+    name: Vec<u8>,
     qtype: u16,
     class: u16,
+    size_in_bytes: usize,
 }
 
-impl TryFrom<&[u8]> for DnsMessageQuestion<'_> {
+impl TryFrom<&[u8]> for DnsMessageQuestion {
     type Error = Error;
 
     fn try_from(question_bytes: &[u8]) -> std::result::Result<Self, Self::Error> {
-        todo!()
+        if question_bytes[0] == 0 {
+            return Err(Error::InvalidQuestion);
+        }
+
+        if question_bytes[0] == b'\0' {
+            return Err(Error::InvalidQuestion);
+        }
+
+        if question_bytes.len() < question_bytes[0] as usize + 1 {
+            return Err(Error::InvalidQuestion);
+        }
+
+        let mut name: Vec<u8> = question_bytes
+            .iter()
+            .take_while(|b| **b != b'\0')
+            .map(|b| b.to_owned())
+            .collect();
+
+        name.push(b'\0');
+
+        if name.len() + 4 > question_bytes.len() {
+            return Err(Error::InvalidQuestion);
+        }
+
+        let qtype =
+            u16::from_be_bytes([question_bytes[name.len()], question_bytes[name.len() + 1]]);
+
+        let class = u16::from_be_bytes([
+            question_bytes[name.len() + 2],
+            question_bytes[name.len() + 3],
+        ]);
+
+        let size_in_bytes = name.len() + 4;
+
+        Ok(DnsMessageQuestion {
+            name,
+            qtype,
+            class,
+            size_in_bytes,
+        })
     }
 }
 
-impl<'a> From<&'a DnsMessageQuestion<'a>> for Vec<u8> {
+impl From<&DnsMessageQuestion> for Vec<u8> {
     fn from(question: &DnsMessageQuestion) -> Self {
         let mut buf: Vec<u8> = Vec::from(question.name.as_slice());
 
@@ -167,11 +207,37 @@ fn main() {
     loop {
         match udp_socket.recv_from(&mut buf) {
             Ok((size, source)) => {
+                println!("Received {} bytes from {}", size, source);
+
                 let mut request_header: DnsMessageHeader = (&buf[0..12])
                     .try_into()
                     .expect("incorrect DNS message header");
 
-                println!("Received {} bytes from {}", size, source);
+                let mut questions: Vec<DnsMessageQuestion> = Vec::new();
+                let mut index = 12;
+                for _ in 0..request_header.qd_count {
+                    let question: DnsMessageQuestion = (&buf[index..]).try_into().unwrap();
+                    index += question.size_in_bytes;
+                    questions.push(question);
+                }
+
+                let answers: Vec<DnsMessageResponse> = questions
+                    .iter()
+                    .map(|q| {
+                        let data = vec![1, 1, 1, 1];
+
+                        DnsMessageResponse {
+                            name: &q.name,
+                            qtype: q.qtype,
+                            class: q.class,
+                            ttl: 60,
+                            length: data.len() as u16,
+                            data,
+                        }
+                    })
+                    .collect();
+
+                // reponses section
 
                 request_header.qr = true;
                 request_header.qd_count = 1;
@@ -184,40 +250,29 @@ fn main() {
                 }
 
                 let response_header = request_header;
+                let response_header_bytes: [u8; 12] = (&response_header).into();
 
-                let response_header: [u8; 12] = (&response_header).into();
+                // let fixed_name = {
+                //     let mut buf: Vec<u8> = vec![12];
+                //     buf.extend_from_slice("codecrafters".as_bytes());
+                //     buf.push(2);
+                //     buf.extend_from_slice("io".as_bytes());
+                //     buf.push(b'\0');
 
-                let fixed_name = {
-                    let mut buf: Vec<u8> = vec![12];
-                    buf.extend_from_slice("codecrafters".as_bytes());
-                    buf.push(2);
-                    buf.extend_from_slice("io".as_bytes());
-                    buf.push(b'\0');
+                //     buf
+                // };
 
-                    buf
-                };
+                let response_question_bytes: Vec<u8> =
+                    questions.iter().flat_map(Vec::from).collect();
 
-                let response_question = DnsMessageQuestion {
-                    name: &fixed_name,
-                    qtype: 1,
-                    class: 1,
-                };
-
-                let response_answer = DnsMessageResponse {
-                    name: &fixed_name,
-                    qtype: 1,
-                    class: 1,
-                    ttl: 60,
-                    length: 4,
-                    data: vec![8, 8, 8, 8],
-                };
+                let response_answer_bytes: Vec<u8> = answers.iter().flat_map(Vec::from).collect();
 
                 udp_socket
                     .send_to(
                         &([
-                            Vec::from(response_header),
-                            (&response_question).into(),
-                            (&response_answer).into(),
+                            Vec::from(response_header_bytes),
+                            response_question_bytes,
+                            response_answer_bytes,
                         ]
                         .concat()),
                         source,
