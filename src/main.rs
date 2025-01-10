@@ -27,7 +27,7 @@ impl std::error::Error for Error {}
 struct DnsMessageHeader {
     id: u16,
     qr: bool,
-    op_code: u8, // 4bit
+    op_code: u8,
     aa: bool,
     tc: bool,
     rd: bool,
@@ -337,18 +337,20 @@ fn main() {
                                 resolver_req_bytes.put_slice(&resolver_req_header_bytes);
                                 resolver_req_bytes.put_slice(&resolver_question_bytes);
 
-                                resolver_socket
+                                if resolver_socket
                                     .send(&resolver_req_bytes.freeze()[..])
-                                    .unwrap();
+                                    .is_ok()
+                                {
+                                    let mut resolver_buf = [0; 512];
 
-                                let mut resolver_buf = [0; 512];
-
-                                if let Ok((_, _)) = resolver_socket.recv_from(&mut resolver_buf) {
-                                    match dns_response_from_bytes(
-                                        &resolver_buf[12 + resolver_question_bytes.len()..],
-                                    ) {
-                                        Ok(response) => answers.push(response),
-                                        Err(e) => eprintln!("response parsing failed, {}", e),
+                                    if let Ok((_, _)) = resolver_socket.recv_from(&mut resolver_buf)
+                                    {
+                                        match dns_response_from_bytes(
+                                            &resolver_buf[12 + resolver_question_bytes.len()..],
+                                        ) {
+                                            Ok(response) => answers.push(response),
+                                            Err(e) => eprintln!("response parsing failed, {}", e),
+                                        }
                                     }
                                 }
                             }
@@ -372,38 +374,43 @@ fn main() {
                             answers
                         };
 
-                        // reponses section
-                        request_header.qr = true;
-                        request_header.qd_count = questions.len() as u16;
-                        request_header.an_count = answers.len() as u16;
-
-                        if request_header.op_code == 0 {
-                            request_header.rcode = 0;
+                        if answers.is_empty() {
+                            eprintln!("Failed to produce DNS responses for DNS questions")
                         } else {
-                            request_header.rcode = 4;
-                        }
+                            // reponses section
+                            request_header.qr = true;
+                            request_header.qd_count = questions.len() as u16;
+                            request_header.an_count = answers.len() as u16;
 
-                        let response_header = request_header;
-                        let response_header_bytes: [u8; 12] = (&response_header).into();
+                            if request_header.op_code == 0 {
+                                request_header.rcode = 0;
+                            } else {
+                                request_header.rcode = 4;
+                            }
 
-                        let response_question_bytes: Vec<u8> =
-                            questions.iter().flat_map(Vec::from).collect();
+                            let response_header = request_header;
+                            let response_header_bytes: [u8; 12] = (&response_header).into();
 
-                        let response_answer_bytes: Vec<u8> =
-                            answers.iter().flat_map(Vec::from).collect();
+                            let response_question_bytes: Vec<u8> =
+                                questions.iter().flat_map(Vec::from).collect();
 
-                        let mut response_bytes = BytesMut::with_capacity(
-                            response_header_bytes.len()
-                                + response_question_bytes.len()
-                                + response_answer_bytes.len(),
-                        );
+                            let response_answer_bytes: Vec<u8> =
+                                answers.iter().flat_map(Vec::from).collect();
 
-                        response_bytes.put_slice(&response_header_bytes);
-                        response_bytes.put_slice(&response_question_bytes);
-                        response_bytes.put_slice(&response_answer_bytes);
+                            let mut response_bytes = BytesMut::with_capacity(
+                                response_header_bytes.len()
+                                    + response_question_bytes.len()
+                                    + response_answer_bytes.len(),
+                            );
 
-                        if let Err(e) = udp_socket.send_to(&response_bytes.freeze()[..], source) {
-                            eprintln!("Failed to send response, {}", e);
+                            response_bytes.put_slice(&response_header_bytes);
+                            response_bytes.put_slice(&response_question_bytes);
+                            response_bytes.put_slice(&response_answer_bytes);
+
+                            if let Err(e) = udp_socket.send_to(&response_bytes.freeze()[..], source)
+                            {
+                                eprintln!("Failed to send response, {}", e);
+                            }
                         }
                     } else {
                         eprintln!("Failed to parse questions from {:?}", buf);
