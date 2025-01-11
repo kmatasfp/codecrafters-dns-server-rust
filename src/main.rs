@@ -262,7 +262,7 @@ fn dns_response_from_bytes(data: &[u8]) -> Result<DnsMessageResponse> {
     name.push(b'\0');
 
     if name.len() + 10 > data.len() {
-        return Err(Error::InvalidQuestion);
+        return Err(Error::InvalidResponse);
     }
 
     let qtype = u16::from_be_bytes([data[name.len()], data[name.len() + 1]]);
@@ -277,7 +277,7 @@ fn dns_response_from_bytes(data: &[u8]) -> Result<DnsMessageResponse> {
     let length = u16::from_be_bytes([data[name.len() + 8], data[name.len() + 9]]);
 
     if name.len() + 10 + length as usize > data.len() {
-        return Err(Error::InvalidQuestion);
+        return Err(Error::InvalidResponse);
     }
 
     let data_start_idx = name.len() + 10;
@@ -291,6 +291,41 @@ fn dns_response_from_bytes(data: &[u8]) -> Result<DnsMessageResponse> {
         length,
         data,
     })
+}
+
+fn resolve_questions(
+    resolver_socket: &UdpSocket,
+    header: &DnsMessageHeader,
+    questions: &[DnsMessageQuestion],
+) -> Result<Vec<DnsMessageResponse>> {
+    let mut answers: Vec<DnsMessageResponse> = Vec::with_capacity(questions.len());
+
+    let mut resolver_req_header = header.clone();
+    resolver_req_header.qd_count = 1;
+
+    let resolver_req_header_bytes: [u8; 12] = (&resolver_req_header).into();
+
+    for q in questions.iter() {
+        let resolver_question_bytes = Vec::from(q);
+
+        let mut resolver_req_bytes = BytesMut::with_capacity(12 + resolver_question_bytes.len());
+        resolver_req_bytes.put_slice(&resolver_req_header_bytes);
+        resolver_req_bytes.put_slice(&resolver_question_bytes);
+
+        let resolver_req_bytess = resolver_req_bytes.freeze();
+
+        resolver_socket.send(&resolver_req_bytess[..])?;
+
+        let mut resolver_buf = [0; 512];
+
+        let (_, _) = resolver_socket.recv_from(&mut resolver_buf)?;
+
+        let response =
+            dns_response_from_bytes(&resolver_buf[12 + resolver_question_bytes.len()..])?;
+
+        answers.push(response);
+    }
+    Ok(answers)
 }
 
 fn main() {
@@ -320,63 +355,17 @@ fn main() {
                     if let Ok(questions) =
                         dns_questions_from_bytes(&buf[12..], size - 12, &request_header.qd_count)
                     {
-                        let answers = if let Some(resolver_socket) = &maybe_resolver_socket {
-                            let mut answers: Vec<DnsMessageResponse> =
-                                Vec::with_capacity(questions.len());
+                        let maybe_answers: Result<Vec<DnsMessageResponse>> =
+                            if let Some(resolver_socket) = &maybe_resolver_socket {
+                                resolve_questions(resolver_socket, &request_header, &questions)
+                            } else {
+                                println!("I AM HERE ######");
+                                Ok(Vec::with_capacity(0))
+                            };
 
-                            for q in questions.iter() {
-                                let mut resolver_req_header = request_header.clone();
-                                resolver_req_header.qd_count = 1;
+                        if let Ok(answers) = maybe_answers {
+                            println!("answers, {:?}", answers);
 
-                                let resolver_req_header_bytes: [u8; 12] =
-                                    (&resolver_req_header).into();
-                                let resolver_question_bytes = Vec::from(q);
-
-                                let mut resolver_req_bytes =
-                                    BytesMut::with_capacity(12 + resolver_question_bytes.len());
-                                resolver_req_bytes.put_slice(&resolver_req_header_bytes);
-                                resolver_req_bytes.put_slice(&resolver_question_bytes);
-
-                                if resolver_socket
-                                    .send(&resolver_req_bytes.freeze()[..])
-                                    .is_ok()
-                                {
-                                    let mut resolver_buf = [0; 512];
-
-                                    if let Ok((_, _)) = resolver_socket.recv_from(&mut resolver_buf)
-                                    {
-                                        match dns_response_from_bytes(
-                                            &resolver_buf[12 + resolver_question_bytes.len()..],
-                                        ) {
-                                            Ok(response) => answers.push(response),
-                                            Err(e) => eprintln!("response parsing failed, {}", e),
-                                        }
-                                    }
-                                }
-                            }
-                            answers
-                        } else {
-                            let answers: Vec<DnsMessageResponse> = questions
-                                .iter()
-                                .map(|q| {
-                                    let data = vec![1, 1, 1, 1];
-
-                                    DnsMessageResponse {
-                                        name: q.name.clone(),
-                                        qtype: q.qtype,
-                                        class: q.class,
-                                        ttl: 60,
-                                        length: data.len() as u16,
-                                        data,
-                                    }
-                                })
-                                .collect();
-                            answers
-                        };
-
-                        if answers.is_empty() {
-                            eprintln!("Failed to produce DNS responses for DNS questions")
-                        } else {
                             // reponses section
                             request_header.qr = true;
                             request_header.qd_count = questions.len() as u16;
@@ -406,6 +395,35 @@ fn main() {
                             response_bytes.put_slice(&response_header_bytes);
                             response_bytes.put_slice(&response_question_bytes);
                             response_bytes.put_slice(&response_answer_bytes);
+
+                            if let Err(e) = udp_socket.send_to(&response_bytes.freeze()[..], source)
+                            {
+                                eprintln!("Failed to send response, {}", e);
+                            }
+                        } else {
+                            // respond without answer section
+                            request_header.qr = true;
+                            request_header.qd_count = questions.len() as u16;
+                            request_header.an_count = 0;
+
+                            if request_header.op_code == 0 {
+                                request_header.rcode = 0;
+                            } else {
+                                request_header.rcode = 4;
+                            }
+
+                            let response_header = request_header;
+                            let response_header_bytes: [u8; 12] = (&response_header).into();
+
+                            let response_question_bytes: Vec<u8> =
+                                questions.iter().flat_map(Vec::from).collect();
+
+                            let mut response_bytes = BytesMut::with_capacity(
+                                response_header_bytes.len() + response_question_bytes.len(),
+                            );
+
+                            response_bytes.put_slice(&response_header_bytes);
+                            response_bytes.put_slice(&response_question_bytes);
 
                             if let Err(e) = udp_socket.send_to(&response_bytes.freeze()[..], source)
                             {
