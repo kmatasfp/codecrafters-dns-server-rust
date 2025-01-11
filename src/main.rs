@@ -359,13 +359,10 @@ fn main() {
                             if let Some(resolver_socket) = &maybe_resolver_socket {
                                 resolve_questions(resolver_socket, &request_header, &questions)
                             } else {
-                                println!("I AM HERE ######");
                                 Ok(Vec::with_capacity(0))
                             };
 
                         if let Ok(answers) = maybe_answers {
-                            println!("answers, {:?}", answers);
-
                             // reponses section
                             request_header.qr = true;
                             request_header.qd_count = questions.len() as u16;
